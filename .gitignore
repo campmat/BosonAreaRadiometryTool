@@ -1,0 +1,10 @@
+bart/
+venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+*.npy
+*.npz
+recordings/
