@@ -4,8 +4,11 @@ import sys
 import os
 import math
 import random
+import json
+import csv
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
+from datetime import datetime
 
 import numpy as np
 import cv2
@@ -19,6 +22,9 @@ except Exception:  # Allows GUI development on PCs without FLIR/flirpy installed
 Point = Tuple[int, int]
 
 
+# -----------------------------------------------------------------------------
+# Utility functions
+# -----------------------------------------------------------------------------
 def resource_path(relative_path: str) -> str:
     """Get absolute path to resource, works in development and PyInstaller bundle."""
     if hasattr(sys, "_MEIPASS"):
@@ -33,6 +39,7 @@ def find_ui_file() -> str:
         resource_path("window.ui"),
         os.path.join(os.path.dirname(__file__), "ui", "window.ui"),
         os.path.join(os.path.dirname(__file__), "window.ui"),
+        "/mnt/data/window(5).ui",  # useful only while testing in this ChatGPT sandbox
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -45,6 +52,11 @@ def frame_to_temperature_c(frame: np.ndarray) -> np.ndarray:
     return frame.astype(np.float32) / 100.0 - 273.15
 
 
+def temperature_c_to_raw_tlinear(temp_img: np.ndarray) -> np.ndarray:
+    """Convert Celsius image back to Boson-like TLinear values for optional export."""
+    return np.round((temp_img + 273.15) * 100.0).astype(np.uint16)
+
+
 def normalize_for_display(temp_img: np.ndarray) -> np.ndarray:
     """Normalize temperature image to 8-bit grayscale for display only."""
     display = cv2.normalize(temp_img, None, 0, 255, cv2.NORM_MINMAX)
@@ -55,10 +67,29 @@ def qcolor_to_bgr(color: QtGui.QColor) -> Tuple[int, int, int]:
     return color.blue(), color.green(), color.red()
 
 
+def qcolor_to_rgba_dict(color: QtGui.QColor) -> Dict[str, int]:
+    return {"r": color.red(), "g": color.green(), "b": color.blue(), "a": color.alpha()}
+
+
+def rgba_dict_to_qcolor(data: Dict[str, Any]) -> QtGui.QColor:
+    return QtGui.QColor(int(data.get("r", 255)), int(data.get("g", 0)), int(data.get("b", 0)), int(data.get("a", 255)))
+
+
 def random_roi_color() -> QtGui.QColor:
     return QtGui.QColor(random.randint(40, 255), random.randint(40, 255), random.randint(40, 255))
 
 
+def timestamp_for_folder() -> str:
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def timestamp_iso() -> str:
+    return datetime.now().isoformat(timespec="milliseconds")
+
+
+# -----------------------------------------------------------------------------
+# Data classes
+# -----------------------------------------------------------------------------
 @dataclass
 class Roi:
     roi_type: str
@@ -74,6 +105,14 @@ class Roi:
         if 0 <= y < self.mask.shape[0] and 0 <= x < self.mask.shape[1]:
             return bool(self.mask[y, x])
         return False
+
+    def to_json_dict(self) -> Dict[str, Any]:
+        return {
+            "type": self.roi_type,
+            "points": [[int(x), int(y)] for x, y in self.points],
+            "color": qcolor_to_rgba_dict(self.color),
+            "area_px": self.area_px,
+        }
 
 
 class RoiStatisticsDialog(QtWidgets.QDialog):
@@ -98,51 +137,91 @@ class RoiStatisticsDialog(QtWidgets.QDialog):
         self.populate(rois, temp_img)
 
     def update_statistics(self, temp_img: Optional[np.ndarray]) -> None:
-        """Refresh statistics while the dialog is open and camera frames are updating."""
+        """Refresh statistics while the dialog is open and camera/playback frames are updating."""
         self.temp_img = temp_img
         self.populate(self.rois, self.temp_img)
 
     def populate(self, rois: List[Roi], temp_img: Optional[np.ndarray]) -> None:
         self.table.setRowCount(len(rois))
         for row, roi in enumerate(rois):
-            values = [roi.roi_type, str(roi.area_px)]
-
-            if temp_img is not None and temp_img.shape[:2] == roi.mask.shape:
-                roi_values = temp_img[roi.mask > 0]
-                if roi_values.size > 0:
-                    values.extend([
-                        f"{np.min(roi_values):.2f}",
-                        f"{np.max(roi_values):.2f}",
-                        f"{np.mean(roi_values):.2f}",
-                        f"{np.std(roi_values):.2f}",
-                    ])
-                else:
-                    values.extend(["—", "—", "—", "—"])
-            else:
-                values.extend(["—", "—", "—", "—"])
-
+            stats = compute_roi_statistics(temp_img, roi)
+            values = [
+                roi.roi_type,
+                str(roi.area_px),
+                format_stat(stats.get("min_c")),
+                format_stat(stats.get("max_c")),
+                format_stat(stats.get("mean_c")),
+                format_stat(stats.get("std_c")),
+            ]
             for col, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
                 self.table.setItem(row, col, item)
 
 
+def compute_roi_statistics(temp_img: Optional[np.ndarray], roi: Roi) -> Dict[str, Optional[float]]:
+    if temp_img is None or temp_img.shape[:2] != roi.mask.shape:
+        return {"min_c": None, "max_c": None, "mean_c": None, "std_c": None}
+
+    roi_values = temp_img[roi.mask > 0]
+    if roi_values.size == 0:
+        return {"min_c": None, "max_c": None, "mean_c": None, "std_c": None}
+
+    return {
+        "min_c": float(np.min(roi_values)),
+        "max_c": float(np.max(roi_values)),
+        "mean_c": float(np.mean(roi_values)),
+        "std_c": float(np.std(roi_values)),
+    }
+
+
+def format_stat(value: Optional[float]) -> str:
+    return "—" if value is None else f"{value:.2f}"
+
+
+# -----------------------------------------------------------------------------
+# Main window
+# -----------------------------------------------------------------------------
 class BARTWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         uic.loadUi(find_ui_file(), self)
 
+        # ROI drawing state
         self.active_tool: Optional[str] = None
         self.current_points: List[Point] = []
         self.current_hover_point: Optional[Point] = None
         self.rois: List[Roi] = []
         self.statistics_dialogs: List[RoiStatisticsDialog] = []
 
+        # Camera and image state
         self.camera = None
         self.current_temp_img: Optional[np.ndarray] = None
         self.current_display_img: Optional[np.ndarray] = None
         self.image_shape = (320, 320)  # Updated after first frame
 
+        # Recording state
+        self.recording_root_dir: Optional[str] = None
+        self.recording_session_dir: Optional[str] = None
+        self.recording_raw_dir: Optional[str] = None
+        self.recording_annotated_dir: Optional[str] = None
+        self.recording_stats_path: Optional[str] = None
+        self.recording_csv_file = None
+        self.recording_csv_writer: Optional[csv.DictWriter] = None
+        self.is_recording = False
+        self.recorded_frame_index = 0
+
+        # Playback state
+        self.is_playback_mode = False
+        self.is_playback_running = False
+        self.playback_session_dir: Optional[str] = None
+        self.playback_raw_files: List[str] = []
+        self.playback_index = 0
+        self.playback_timer = QtCore.QTimer(self)
+        self.playback_timer.timeout.connect(self.advance_playback_frame)
+        self.playback_timer.setInterval(100)  # default 10 fps playback
+
+        # Graphics scene
         self.scene = QtWidgets.QGraphicsScene(self)
         self.pixmap_item = QtWidgets.QGraphicsPixmapItem()
         self.scene.addItem(self.pixmap_item)
@@ -153,14 +232,16 @@ class BARTWindow(QtWidgets.QMainWindow):
         self.graphicsView.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.SmoothPixmapTransform)
 
         self.configure_buttons()
+        self.configure_menu_actions()
         self.configure_roi_table()
+        self.configure_recording_playback_controls()
         self.start_camera()
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(30)
 
-    # ---------------------------- setup ----------------------------
+    # ------------------------------------------------------------------ setup
     def configure_buttons(self) -> None:
         self.tool_buttons = {
             "Rectangle": self.rectangleButton,
@@ -170,6 +251,32 @@ class BARTWindow(QtWidgets.QMainWindow):
         for tool_name, button in self.tool_buttons.items():
             button.setCheckable(True)
             button.clicked.connect(lambda checked, name=tool_name: self.activate_tool(name))
+
+    def configure_menu_actions(self) -> None:
+        # Object names are taken from the provided window.ui.
+        self.action_Recording_dir.triggered.connect(self.select_recording_directory)
+        self.actionSave_current_frame.triggered.connect(self.save_current_frame)
+        self.action_Start_recording.triggered.connect(self.start_recording)
+        self.actionS_top_recording.triggered.connect(self.stop_recording)
+        self.action_Open_recording.triggered.connect(self.open_recording_session)
+        self.action_Exit.triggered.connect(self.close)
+        self.action_About.triggered.connect(self.show_about_dialog)
+
+        # Settings placeholders: these are connected so the UI does something useful already.
+        self.action_Recording_settings.triggered.connect(self.show_recording_settings_placeholder)
+        self.action_Temperature_conversion.triggered.connect(self.show_temperature_conversion_placeholder)
+
+    def configure_recording_playback_controls(self) -> None:
+        self.snapshotButton.clicked.connect(self.save_current_frame)
+        self.startRecordingButton.clicked.connect(self.start_recording)
+        self.stopButtonRecording.clicked.connect(self.stop_recording)
+        self.openRecordingButton.clicked.connect(self.open_recording_session)
+        self.playButton.clicked.connect(self.play_loaded_recording)
+        self.pauseButton.clicked.connect(self.pause_playback)
+        self.horizontalSlider.valueChanged.connect(self.slider_changed)
+        self.horizontalSlider.setEnabled(False)
+        self.pauseButton.setEnabled(False)
+        self.stopButtonRecording.setEnabled(False)
 
     def configure_roi_table(self) -> None:
         self.tableWidget.setColumnCount(3)
@@ -192,7 +299,7 @@ class BARTWindow(QtWidgets.QMainWindow):
             self.camera = None
             self.statusBar().showMessage(f"Could not open FLIR Boson. Using simulated frame. Reason: {exc}")
 
-    # ---------------------------- tool state ----------------------------
+    # ------------------------------------------------------------- tool state
     def activate_tool(self, tool_name: str) -> None:
         """Activate one drawing tool and reset any unfinished shape."""
         self.active_tool = tool_name
@@ -203,7 +310,7 @@ class BARTWindow(QtWidgets.QMainWindow):
             is_active = name == tool_name
             button.blockSignals(True)
             button.setChecked(is_active)
-            button.setEnabled(not is_active)  # visually shows active and prevents duplicate click
+            button.setEnabled(not is_active)
             button.blockSignals(False)
 
         self.statusBar().showMessage(f"Active ROI tool: {tool_name}")
@@ -220,8 +327,12 @@ class BARTWindow(QtWidgets.QMainWindow):
             button.blockSignals(False)
         self.render_scene()
 
-    # ---------------------------- camera and rendering ----------------------------
+    # ------------------------------------------------------ camera/rendering
     def update_frame(self) -> None:
+        """Main live-camera update loop. Disabled while browsing playback sessions."""
+        if self.is_playback_mode:
+            return
+
         try:
             if self.camera is not None:
                 raw_frame = self.camera.grab()
@@ -238,19 +349,28 @@ class BARTWindow(QtWidgets.QMainWindow):
         self.render_scene()
         self.update_open_statistics_dialogs()
 
+        if self.is_recording:
+            self.record_current_frame()
+
     def simulated_temperature_frame(self) -> np.ndarray:
         h, w = self.image_shape
         y = np.linspace(0, 1, h, dtype=np.float32)[:, None]
         x = np.linspace(0, 1, w, dtype=np.float32)[None, :]
         return 22.0 + 8.0 * x + 4.0 * y + np.random.normal(0, 0.08, (h, w)).astype(np.float32)
 
-    def render_scene(self) -> None:
+    def make_annotated_image(self) -> Optional[np.ndarray]:
+        """Return the visible image with committed ROIs and active preview drawn on top."""
         if self.current_display_img is None:
-            return
-
+            return None
         image = self.current_display_img.copy()
         self.draw_committed_rois(image)
         self.draw_preview(image)
+        return image
+
+    def render_scene(self) -> None:
+        image = self.make_annotated_image()
+        if image is None:
+            return
 
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         h, w, channels = rgb.shape
@@ -298,24 +418,22 @@ class BARTWindow(QtWidgets.QMainWindow):
                 b = max(1, int(perpendicular_distance(points[2], center, axis_point)))
             cv2.ellipse(image, center, (a, b), angle, 0, 360, color, thickness, cv2.LINE_AA)
         elif roi_type == "Polygon" and len(points) >= 2:
-            # Close the outline only after the polygon has at least 3 points.
-            # During two-point preview it remains an open segment.
             is_closed = len(points) >= 3
             cv2.polylines(image, [np.array(points, dtype=np.int32)], is_closed, color, thickness, cv2.LINE_AA)
 
-    # ---------------------------- interaction ----------------------------
+    # --------------------------------------------------------------- events
     def eventFilter(self, obj, event):
         if obj is self.graphicsView.viewport():
             if event.type() == QtCore.QEvent.MouseMove:
                 point = self.view_to_image_point(event.pos())
-                if point is not None:
+                if point is not None and not self.is_playback_mode:
                     self.current_hover_point = point
                     self.render_scene()
                 return False
 
             if event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
                 point = self.view_to_image_point(event.pos())
-                if point is not None and self.active_tool:
+                if point is not None and self.active_tool and not self.is_playback_mode:
                     self.add_current_point(point)
                     return True
 
@@ -384,7 +502,7 @@ class BARTWindow(QtWidgets.QMainWindow):
         h, w = self.image_shape
         return int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1))
 
-    # ---------------------------- ROI creation ----------------------------
+    # ------------------------------------------------------------ ROI logic
     def commit_current_roi(self) -> None:
         if not self.active_tool:
             return
@@ -397,6 +515,7 @@ class BARTWindow(QtWidgets.QMainWindow):
         roi = Roi(self.active_tool, list(self.current_points), mask, random_roi_color())
         self.rois.append(roi)
         self.add_roi_table_row(roi)
+        self.save_rois_if_recording()
         self.statusBar().showMessage(f"Added {roi.roi_type} ROI, area = {roi.area_px} px²")
         self.current_points.clear()
         self.current_hover_point = None
@@ -445,12 +564,14 @@ class BARTWindow(QtWidgets.QMainWindow):
         self.tableWidget.setItem(row, 1, type_item)
         self.tableWidget.setItem(row, 2, area_item)
 
+    def refresh_roi_table(self) -> None:
+        self.tableWidget.setRowCount(0)
+        for roi in self.rois:
+            self.add_roi_table_row(roi)
+
     def delete_selected_rois(self) -> None:
         """Delete selected ROI rows and their corresponding shapes."""
-        selected_rows = sorted(
-            {index.row() for index in self.tableWidget.selectedIndexes()},
-            reverse=True,
-        )
+        selected_rows = sorted({index.row() for index in self.tableWidget.selectedIndexes()}, reverse=True)
         if not selected_rows:
             return
 
@@ -459,18 +580,10 @@ class BARTWindow(QtWidgets.QMainWindow):
                 del self.rois[row]
                 self.tableWidget.removeRow(row)
 
+        self.save_rois_if_recording()
         self.render_scene()
         self.update_open_statistics_dialogs()
         self.statusBar().showMessage(f"Deleted {len(selected_rows)} ROI(s).")
-
-    def update_open_statistics_dialogs(self) -> None:
-        """Refresh all visible statistics dialogs and forget dialogs that were closed."""
-        still_open = []
-        for dialog in self.statistics_dialogs:
-            if dialog.isVisible():
-                dialog.update_statistics(self.current_temp_img)
-                still_open.append(dialog)
-        self.statistics_dialogs = still_open
 
     def update_color_button_style(self, button: QtWidgets.QPushButton, color: QtGui.QColor) -> None:
         button.setStyleSheet(
@@ -486,17 +599,348 @@ class BARTWindow(QtWidgets.QMainWindow):
         if color.isValid():
             roi.color = color
             self.update_color_button_style(button, color)
+            self.save_rois_if_recording()
             self.render_scene()
 
+    # ---------------------------------------------------------- statistics
     def open_statistics_dialog(self, *args) -> None:
-        # Non-modal dialog so it can update live while the camera stream continues.
         dialog = RoiStatisticsDialog(self.rois, self.current_temp_img, self)
         dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         dialog.destroyed.connect(lambda *_: self.update_open_statistics_dialogs())
         self.statistics_dialogs.append(dialog)
         dialog.show()
 
+    def update_open_statistics_dialogs(self) -> None:
+        """Refresh all visible statistics dialogs and forget dialogs that were closed."""
+        still_open = []
+        for dialog in self.statistics_dialogs:
+            if dialog.isVisible():
+                dialog.update_statistics(self.current_temp_img)
+                still_open.append(dialog)
+        self.statistics_dialogs = still_open
+
+    # ----------------------------------------------------------- recording
+    def select_recording_directory(self) -> None:
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Select recording directory")
+        if directory:
+            self.recording_root_dir = directory
+            self.statusBar().showMessage(f"Recording directory: {directory}")
+
+    def ensure_recording_root_dir(self) -> bool:
+        if self.recording_root_dir and os.path.isdir(self.recording_root_dir):
+            return True
+        self.select_recording_directory()
+        return bool(self.recording_root_dir and os.path.isdir(self.recording_root_dir))
+
+    def create_recording_session(self) -> bool:
+        if not self.ensure_recording_root_dir():
+            return False
+
+        session_name = f"bart_session_{timestamp_for_folder()}"
+        self.recording_session_dir = os.path.join(self.recording_root_dir, session_name)
+        self.recording_raw_dir = os.path.join(self.recording_session_dir, "frames_raw")
+        self.recording_annotated_dir = os.path.join(self.recording_session_dir, "frames_annotated")
+        os.makedirs(self.recording_raw_dir, exist_ok=True)
+        os.makedirs(self.recording_annotated_dir, exist_ok=True)
+
+        self.save_session_metadata()
+        self.save_rois_json(os.path.join(self.recording_session_dir, "rois.json"))
+        self.start_statistics_csv(os.path.join(self.recording_session_dir, "statistics.csv"))
+        self.recorded_frame_index = 0
+        return True
+
+    def start_recording(self) -> None:
+        if self.is_playback_mode:
+            QtWidgets.QMessageBox.warning(self, "Recording", "Close playback mode before recording.")
+            return
+        if self.is_recording:
+            return
+        if not self.create_recording_session():
+            return
+
+        self.is_recording = True
+        self.startRecordingButton.setEnabled(False)
+        self.stopButtonRecording.setEnabled(True)
+        self.statusBar().showMessage(f"Recording started: {self.recording_session_dir}")
+
+    def stop_recording(self) -> None:
+        if not self.is_recording:
+            return
+        self.is_recording = False
+        self.close_statistics_csv()
+        self.save_session_metadata()
+        self.save_rois_if_recording(force=True)
+        self.startRecordingButton.setEnabled(True)
+        self.stopButtonRecording.setEnabled(False)
+        self.statusBar().showMessage(f"Recording stopped. Frames saved: {self.recorded_frame_index}")
+
+    def save_current_frame(self) -> None:
+        if self.current_temp_img is None:
+            QtWidgets.QMessageBox.warning(self, "Save frame", "No current frame is available yet.")
+            return
+        if not self.ensure_recording_root_dir():
+            return
+
+        frame_dir = os.path.join(self.recording_root_dir, f"single_frame_{timestamp_for_folder()}")
+        os.makedirs(frame_dir, exist_ok=True)
+        raw_path = os.path.join(frame_dir, "raw_temperature_c.npy")
+        png_path = os.path.join(frame_dir, "annotated_frame.png")
+        roi_path = os.path.join(frame_dir, "rois.json")
+        stats_path = os.path.join(frame_dir, "statistics.csv")
+
+        np.save(raw_path, self.current_temp_img.astype(np.float32))
+        annotated = self.make_annotated_image()
+        if annotated is not None:
+            cv2.imwrite(png_path, annotated)
+        self.save_rois_json(roi_path)
+        self.write_single_frame_statistics_csv(stats_path)
+        self.statusBar().showMessage(f"Saved frame to: {frame_dir}")
+
+    def record_current_frame(self) -> None:
+        if self.current_temp_img is None or not self.recording_raw_dir or not self.recording_annotated_dir:
+            return
+
+        idx = self.recorded_frame_index
+        frame_name = f"frame_{idx:06d}"
+        np.save(os.path.join(self.recording_raw_dir, f"{frame_name}.npy"), self.current_temp_img.astype(np.float32))
+
+        annotated = self.make_annotated_image()
+        if annotated is not None:
+            cv2.imwrite(os.path.join(self.recording_annotated_dir, f"{frame_name}.png"), annotated)
+
+        self.write_statistics_rows(idx, timestamp_iso())
+        self.recorded_frame_index += 1
+
+    def start_statistics_csv(self, path: str) -> None:
+        self.recording_stats_path = path
+        self.recording_csv_file = open(path, "w", newline="", encoding="utf-8")
+        fieldnames = [
+            "frame_index", "timestamp", "roi_index", "type", "area_px",
+            "min_c", "max_c", "mean_c", "std_c",
+        ]
+        self.recording_csv_writer = csv.DictWriter(self.recording_csv_file, fieldnames=fieldnames)
+        self.recording_csv_writer.writeheader()
+
+    def close_statistics_csv(self) -> None:
+        if self.recording_csv_file is not None:
+            self.recording_csv_file.flush()
+            self.recording_csv_file.close()
+        self.recording_csv_file = None
+        self.recording_csv_writer = None
+
+    def write_statistics_rows(self, frame_index: int, timestamp: str) -> None:
+        if self.recording_csv_writer is None:
+            return
+        for roi_index, roi in enumerate(self.rois):
+            stats = compute_roi_statistics(self.current_temp_img, roi)
+            self.recording_csv_writer.writerow({
+                "frame_index": frame_index,
+                "timestamp": timestamp,
+                "roi_index": roi_index,
+                "type": roi.roi_type,
+                "area_px": roi.area_px,
+                "min_c": stats.get("min_c"),
+                "max_c": stats.get("max_c"),
+                "mean_c": stats.get("mean_c"),
+                "std_c": stats.get("std_c"),
+            })
+        if self.recording_csv_file is not None:
+            self.recording_csv_file.flush()
+
+    def write_single_frame_statistics_csv(self, path: str) -> None:
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            fieldnames = ["roi_index", "type", "area_px", "min_c", "max_c", "mean_c", "std_c"]
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for roi_index, roi in enumerate(self.rois):
+                stats = compute_roi_statistics(self.current_temp_img, roi)
+                writer.writerow({
+                    "roi_index": roi_index,
+                    "type": roi.roi_type,
+                    "area_px": roi.area_px,
+                    "min_c": stats.get("min_c"),
+                    "max_c": stats.get("max_c"),
+                    "mean_c": stats.get("mean_c"),
+                    "std_c": stats.get("std_c"),
+                })
+
+    def save_session_metadata(self) -> None:
+        if not self.recording_session_dir:
+            return
+        metadata = {
+            "application": "Boson Area Radiometry Tool",
+            "created_or_updated": timestamp_iso(),
+            "frame_count": self.recorded_frame_index,
+            "raw_frame_format": "NumPy .npy, float32 temperature in Celsius",
+            "annotated_frame_format": "PNG, 8-bit normalized display image with ROI overlay",
+            "temperature_conversion": "Assumed Boson TLinear: Celsius = raw / 100 - 273.15",
+            "image_shape": list(self.image_shape),
+        }
+        with open(os.path.join(self.recording_session_dir, "session.json"), "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+
+    def save_rois_if_recording(self, force: bool = False) -> None:
+        if (self.is_recording or force) and self.recording_session_dir:
+            self.save_rois_json(os.path.join(self.recording_session_dir, "rois.json"))
+
+    def save_rois_json(self, path: str) -> None:
+        data = {
+            "image_shape": list(self.image_shape),
+            "rois": [roi.to_json_dict() for roi in self.rois],
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+
+    # ------------------------------------------------------------ playback
+    def open_recording_session(self) -> None:
+        if self.is_recording:
+            QtWidgets.QMessageBox.warning(self, "Open recording", "Stop the current recording before opening playback.")
+            return
+
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Open recording session")
+        if not directory:
+            return
+
+        raw_dir = os.path.join(directory, "frames_raw")
+        if not os.path.isdir(raw_dir):
+            QtWidgets.QMessageBox.warning(self, "Open recording", "Selected directory does not contain frames_raw/.")
+            return
+
+        raw_files = sorted(
+            os.path.join(raw_dir, name)
+            for name in os.listdir(raw_dir)
+            if name.lower().endswith(".npy")
+        )
+        if not raw_files:
+            QtWidgets.QMessageBox.warning(self, "Open recording", "No .npy frames were found in frames_raw/.")
+            return
+
+        self.is_playback_mode = True
+        self.is_playback_running = False
+        self.playback_session_dir = directory
+        self.playback_raw_files = raw_files
+        self.playback_index = 0
+        self.deactivate_tool()
+        self.load_rois_from_session(directory)
+
+        self.horizontalSlider.blockSignals(True)
+        self.horizontalSlider.setMinimum(0)
+        self.horizontalSlider.setMaximum(len(raw_files) - 1)
+        self.horizontalSlider.setValue(0)
+        self.horizontalSlider.setEnabled(True)
+        self.horizontalSlider.blockSignals(False)
+
+        self.pauseButton.setEnabled(True)
+        self.playButton.setEnabled(True)
+        self.startRecordingButton.setEnabled(False)
+        self.snapshotButton.setEnabled(True)
+
+        self.show_playback_frame(0)
+        self.statusBar().showMessage(f"Loaded recording: {directory}")
+
+    def load_rois_from_session(self, directory: str) -> None:
+        path = os.path.join(directory, "rois.json")
+        if not os.path.exists(path):
+            self.rois.clear()
+            self.refresh_roi_table()
+            return
+
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        rois = []
+        for item in data.get("rois", []):
+            points = [tuple(map(int, p)) for p in item.get("points", [])]
+            roi_type = item.get("type", "Unknown")
+            color = rgba_dict_to_qcolor(item.get("color", {}))
+            mask = self.create_mask_from_points_for_shape(roi_type, points)
+            if mask is not None:
+                rois.append(Roi(roi_type, points, mask, color))
+        self.rois = rois
+        self.refresh_roi_table()
+
+    def create_mask_from_points_for_shape(self, roi_type: str, points: List[Point]) -> Optional[np.ndarray]:
+        return self.create_mask(roi_type, points)
+
+    def play_loaded_recording(self) -> None:
+        if not self.playback_raw_files:
+            self.open_recording_session()
+            return
+        self.is_playback_mode = True
+        self.is_playback_running = True
+        self.playback_timer.start()
+        self.statusBar().showMessage("Playback started.")
+
+    def pause_playback(self) -> None:
+        self.is_playback_running = False
+        self.playback_timer.stop()
+        self.statusBar().showMessage("Playback paused.")
+
+    def advance_playback_frame(self) -> None:
+        if not self.playback_raw_files:
+            self.pause_playback()
+            return
+        next_index = self.playback_index + 1
+        if next_index >= len(self.playback_raw_files):
+            next_index = 0
+        self.show_playback_frame(next_index)
+
+    def slider_changed(self, value: int) -> None:
+        if self.is_playback_mode and self.playback_raw_files:
+            self.show_playback_frame(value)
+
+    def show_playback_frame(self, index: int) -> None:
+        if not self.playback_raw_files:
+            return
+        index = int(np.clip(index, 0, len(self.playback_raw_files) - 1))
+        self.playback_index = index
+        self.current_temp_img = np.load(self.playback_raw_files[index]).astype(np.float32)
+        self.image_shape = self.current_temp_img.shape[:2]
+        display_gray = normalize_for_display(self.current_temp_img)
+        self.current_display_img = cv2.cvtColor(display_gray, cv2.COLOR_GRAY2BGR)
+
+        self.horizontalSlider.blockSignals(True)
+        self.horizontalSlider.setValue(index)
+        self.horizontalSlider.blockSignals(False)
+
+        self.render_scene()
+        self.update_open_statistics_dialogs()
+        self.statusBar().showMessage(f"Playback frame {index + 1}/{len(self.playback_raw_files)}")
+
+    def leave_playback_mode(self) -> None:
+        self.pause_playback()
+        self.is_playback_mode = False
+        self.playback_raw_files.clear()
+        self.horizontalSlider.setEnabled(False)
+        self.startRecordingButton.setEnabled(True)
+        self.statusBar().showMessage("Returned to live camera mode.")
+
+    # -------------------------------------------------------------- dialogs
+    def show_about_dialog(self) -> None:
+        QtWidgets.QMessageBox.information(
+            self,
+            "About BART",
+            "Boson Area Radiometry Tool\n\n"
+            "Live ROI temperature measurement and recording tool for FLIR Boson cameras.",
+        )
+
+    def show_recording_settings_placeholder(self) -> None:
+        QtWidgets.QMessageBox.information(
+            self,
+            "Recording settings",
+            "Recording settings can be added here later, e.g. FPS limit, save raw frames, save annotated frames, and CSV export options.",
+        )
+
+    def show_temperature_conversion_placeholder(self) -> None:
+        QtWidgets.QMessageBox.information(
+            self,
+            "Temperature conversion",
+            "Current assumption:\n\nTemperature [°C] = raw / 100 - 273.15\n\nAdd emissivity/reflected-temperature settings here later if needed.",
+        )
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self.is_recording:
+            self.stop_recording()
+        self.pause_playback()
         if self.camera is not None:
             try:
                 self.camera.close()
@@ -505,6 +949,9 @@ class BARTWindow(QtWidgets.QMainWindow):
         event.accept()
 
 
+# -----------------------------------------------------------------------------
+# Geometry helpers
+# -----------------------------------------------------------------------------
 def distance(p1: Point, p2: Point) -> float:
     return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
 
